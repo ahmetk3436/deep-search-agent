@@ -1,8 +1,8 @@
 """
 Multi-Platform Deep Research Agent
 ===================================
-An intelligent research agent that routes queries to the best search engine
-based on the nature of the request using LangGraph.
+An intelligent research agent that routes queries to best search engine
+based on nature of request using LangGraph.
 
 Architecture:
 - Brain: DeepSeek-R1 (Router/Planner)
@@ -11,9 +11,10 @@ Architecture:
 """
 
 import os
-from typing import TypedDict, List, Literal, Annotated, Optional
+from typing import TypedDict, List, Literal, Annotated, Optional, Tuple
 from operator import add
 import json
+from datetime import datetime
 
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
@@ -64,6 +65,39 @@ writer_llm = ChatOpenAI(
 
 
 # ============================================================================
+# TRANSLATION FUNCTION
+# ============================================================================
+
+def detect_and_translate_query(query: str) -> Tuple[str, bool]:
+    """
+    Detect if query is non-English and translate to English.
+    
+    Returns:
+        (translated_query, was_translated)
+    """
+    # Simple check for non-ASCII characters
+    is_non_english = any(ord(char) > 127 for char in query)
+    
+    if not is_non_english:
+        return query, False
+    
+    # Translate to English using LLM
+    translator_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a translator. Translate the given text to English accurately. Return ONLY the translation, nothing else."),
+        ("human", "{text}")
+    ])
+    
+    try:
+        response = deepseek_llm.invoke(translator_prompt.format_messages(text=query))
+        translated = response.content.strip()
+        print(f"   🌐 Translated: '{query}' → '{translated}'")
+        return translated, True
+    except Exception as e:
+        print(f"   ⚠️ Translation failed: {e}, using original query")
+        return query, False
+
+
+# ============================================================================
 # ROUTER NODE - The Brain
 # ============================================================================
 
@@ -99,13 +133,23 @@ def router_node(state: AgentState) -> AgentState:
     """
     print(f"\n🧠 [Router] Analyzing query (Step {state['step_count']}/5)...")
     
+    # Detect and translate if non-English
+    translated_query, was_translated = detect_and_translate_query(state["query"])
+    
+    # Store translated query if not already stored
+    if was_translated and "translated_query" not in state:
+        state["translated_query"] = translated_query
+    
+    # Use translated query for search if available, otherwise original
+    search_query = state.get("translated_query", state["query"])
+    
     # Format current context
     context_str = "\n".join(state.get("research_context", []))[-3000:] if state.get("research_context") else "No previous research."
     
     # Generate routing decision
     response = deepseek_llm.invoke(
         router_prompt.format_messages(
-            query=state["query"],
+            query=search_query,
             context=context_str,
             step_count=state["step_count"]
         )
@@ -280,7 +324,7 @@ writer_prompt = ChatPromptTemplate.from_messages([
 Guidelines:
 1. Synthesize information from ALL sources
 2. Use proper citations: [Source X] format
-3. Structure the report with clear sections:
+3. Structure report with clear sections:
    - Executive Summary
    - Background/Context
    - Key Findings
@@ -302,6 +346,80 @@ Create a comprehensive report based on this research.""")
 ])
 
 
+def summarize_chunk(chunk: str, index: int, total_chunks: int) -> str:
+    """
+    Summarize a chunk of research context.
+    
+    Args:
+        chunk: Text chunk to summarize
+        index: Chunk index
+        total_chunks: Total number of chunks
+    
+    Returns:
+        Summary of the chunk
+    """
+    summary_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a research summarizer. Summarize the following research results concisely but comprehensively.
+
+Keep:
+- Key findings and important information
+- Source names and titles
+- Relevant statistics and data
+- Important quotes or claims
+
+Discard:
+- Repetitive information
+- Minor details
+- Formatting artifacts
+
+Output format: Concise paragraph with bullet points for key facts."""),
+        ("human", f"Chunk {index}/{total_chunks}:\n\n{chunk}")
+    ])
+    
+    try:
+        response = deepseek_llm.invoke(summary_prompt.format_messages())
+        return response.content.strip()
+    except Exception as e:
+        print(f"   ⚠️ Error summarizing chunk {index}: {e}")
+        return f"[Summary Error for chunk {index}]"
+
+
+def process_large_context(context_str: str, max_chunk_size: int = 80000) -> str:
+    """
+    Process large context by splitting into chunks and summarizing each.
+    
+    Args:
+        context_str: Full research context
+        max_chunk_size: Maximum size of each chunk in characters
+    
+    Returns:
+        Combined summary of all chunks
+    """
+    print(f"\n🔄 [Context Processing] Large context detected ({len(context_str):,} chars)")
+    print(f"   → Splitting into chunks and summarizing...")
+    
+    # Split into chunks
+    chunks = []
+    for i in range(0, len(context_str), max_chunk_size):
+        chunk = context_str[i:i + max_chunk_size]
+        chunks.append(chunk)
+    
+    print(f"   → Divided into {len(chunks)} chunks")
+    
+    # Summarize each chunk
+    summaries = []
+    for i, chunk in enumerate(chunks, 1):
+        print(f"   → Summarizing chunk {i}/{len(chunks)}...")
+        summary = summarize_chunk(chunk, i, len(chunks))
+        summaries.append(f"\n### Chunk {i} Summary:\n{summary}")
+    
+    # Combine summaries
+    combined_summary = "\n".join(summaries)
+    print(f"   → ✓ Summarized {len(context_str):,} chars → {len(combined_summary):,} chars")
+    
+    return combined_summary
+
+
 def writer_node(state: AgentState) -> AgentState:
     """
     Writer node that synthesizes all research into a final report.
@@ -311,7 +429,16 @@ def writer_node(state: AgentState) -> AgentState:
     
     # Combine all research context
     context_str = "\n".join(state["research_context"])
-    print(f"   → Processing {len(context_str)} characters of research data...")
+    print(f"   → Total context: {len(context_str):,} characters")
+    
+    # Process large context if needed
+    if len(context_str) > 100000:
+        context_str = process_large_context(context_str)
+        print(f"   → Using summarized context for report generation")
+    else:
+        print(f"   → Context fits in model limits, using as-is")
+    
+    print(f"   → Final context size: {len(context_str):,} characters")
     
     # Generate final report
     response = writer_llm.invoke(
@@ -327,6 +454,42 @@ def writer_node(state: AgentState) -> AgentState:
     print(f"   → ✓ Report generated successfully!")
     
     return state
+
+
+# ============================================================================
+# SAVE REPORT FUNCTION
+# ============================================================================
+
+def save_report(query: str, report_content: str, research_context: List[str]):
+    """
+    Save research report to a file.
+    
+    Args:
+        query: The original research query
+        report_content: The generated report content
+        research_context: List of research context strings
+    """
+    # Create output directory if it doesn't exist
+    output_dir = "reports"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate filename: query-timestamp.md
+    # Sanitize query for filename
+    safe_query = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in query)[:50]
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"{safe_query}-{timestamp}.md"
+    filepath = os.path.join(output_dir, filename)
+    
+    # Save report
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(f"# Research Report: {query}\n\n")
+        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"**Sources:** {len(research_context)} (if accessible)\n\n")
+        f.write("---\n\n")
+        f.write(report_content)
+    
+    print(f"\n💾 Report saved to: {filepath}")
+    return filepath
 
 
 # ============================================================================
@@ -445,9 +608,12 @@ def run_research_agent(query: str):
         print("📊 FINAL REPORT")
         print("=" * 80 + "\n")
         
-        # Print the final report
+        # Print final report
         final_message = final_state["messages"][-1]
         print(final_message.content)
+        
+        # Save report to file
+        save_report(query, final_message.content, final_state['research_context'])
         
         print("\n" + "=" * 80)
         print("✅ RESEARCH COMPLETE")
