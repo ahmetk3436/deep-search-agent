@@ -40,6 +40,8 @@ class AgentState(TypedDict):
     search_queries: Optional[List[str]]  # Queries to search for
     step_count: int  # Number of research iterations
     messages: List[object]  # Conversation history
+    forced_providers: Optional[List[str]]  # Force specific providers (bypass router)
+    max_iterations: int  # Maximum research iterations
 
 
 # ============================================================================
@@ -120,41 +122,113 @@ Output Format (JSON):
 Rules:
 - Provide 2-4 specific search queries
 - Set should_continue=false if enough information has been gathered
-- Maximum 5 research iterations allowed
+- Respect the maximum iteration count shown in the step counter
 """),
-    ("human", "Query: {query}\n\nCurrent Research Context (if any):\n{context}\n\nStep: {step_count}/5")
+    ("human", "Query: {query}\n\nCurrent Research Context (if any):\n{context}\n\nStep: {step_count}/{max_iterations}")
 ])
 
 
 def router_node(state: AgentState) -> AgentState:
     """
     Router node that analyzes the query and decides which search tool to use.
-    Powered by DeepSeek-R1.
+    Powered by DeepSeek-R1. Supports forced provider mode.
     """
-    print(f"\n🧠 [Router] Analyzing query (Step {state['step_count']}/5)...")
-    
+    max_iter = state.get("max_iterations", 5)
+    forced = state.get("forced_providers")
+
+    print(f"\n🧠 [Router] Analyzing query (Step {state['step_count']}/{max_iter})...")
+
     # Detect and translate if non-English
     translated_query, was_translated = detect_and_translate_query(state["query"])
-    
+
     # Store translated query if not already stored
     if was_translated and "translated_query" not in state:
         state["translated_query"] = translated_query
-    
+
     # Use translated query for search if available, otherwise original
     search_query = state.get("translated_query", state["query"])
-    
+
     # Format current context
     context_str = "\n".join(state.get("research_context", []))[-3000:] if state.get("research_context") else "No previous research."
-    
-    # Generate routing decision
+
+    # --- FORCED PROVIDER MODE ---
+    if forced:
+        # Round-robin through forced providers
+        provider_index = (state["step_count"] - 1) % len(forced)
+        selected = forced[provider_index]
+
+        print(f"   🔒 [Forced Mode] Using provider: {selected.upper()} (round-robin {provider_index + 1}/{len(forced)})")
+        print(f"   📋 Provider rotation: {' → '.join(p.upper() for p in forced)}")
+
+        # Still use DeepSeek to generate good search queries
+        query_gen_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a search query generator. Given a research query and existing context, generate 2-4 specific search queries optimized for the search engine: {provider}.
+
+Provider strengths:
+- exa: Academic papers, technical documentation, PDFs, whitepapers
+- tavily: Breaking news, market data, current events, advanced search
+- serper: Broad web search, forums, Reddit, niche content, Google results
+
+Output Format (JSON):
+{{
+    "search_queries": ["query1", "query2", ...],
+    "should_continue": true
+}}
+
+Rules:
+- Generate diverse, specific queries
+- Optimize query style for the target search engine
+- Set should_continue=false if enough information has been gathered"""),
+            ("human", "Query: {query}\n\nTarget Provider: {provider}\n\nCurrent Research Context:\n{context}\n\nStep: {step_count}/{max_iterations}")
+        ])
+
+        try:
+            response = deepseek_llm.invoke(
+                query_gen_prompt.format_messages(
+                    query=search_query,
+                    provider=selected,
+                    context=context_str,
+                    step_count=state["step_count"],
+                    max_iterations=max_iter
+                )
+            )
+
+            content = response.content.strip()
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            decision = json.loads(content)
+            state["search_queries"] = decision["search_queries"]
+            should_continue = decision.get("should_continue", True)
+
+            print(f"   → Queries: {state['search_queries']}")
+
+        except Exception as e:
+            print(f"   ⚠️ Query generation error: {e}, using original query")
+            state["search_queries"] = [search_query]
+            should_continue = True
+
+        state["selected_tool"] = selected
+        state["step_count"] = state["step_count"] + 1
+
+        if not should_continue or state["step_count"] > max_iter:
+            print("   → ✓ Research complete, moving to writer...")
+            state["selected_tool"] = "finish"
+
+        return state
+
+    # --- NORMAL AUTO-ROUTING MODE ---
     response = deepseek_llm.invoke(
         router_prompt.format_messages(
             query=search_query,
             context=context_str,
-            step_count=state["step_count"]
+            step_count=state["step_count"],
+            max_iterations=max_iter
         )
     )
-    
+
     try:
         # Parse JSON response
         content = response.content.strip()
@@ -162,29 +236,29 @@ def router_node(state: AgentState) -> AgentState:
             content = content.split("```json")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-        
+
         decision = json.loads(content)
-        
+
         print(f"   → Selected Tool: {decision['selected_tool'].upper()}")
         print(f"   → Queries: {decision['search_queries']}")
         print(f"   → Reasoning: {decision['reasoning']}")
-        
+
         # Update state
         state["selected_tool"] = decision["selected_tool"]
         state["search_queries"] = decision["search_queries"]
         state["step_count"] = state["step_count"] + 1
-        
+
         # Check if we should continue or finish
-        if not decision.get("should_continue", True) or state["step_count"] >= 5:
+        if not decision.get("should_continue", True) or state["step_count"] > max_iter:
             print("   → ✓ Research complete, moving to writer...")
             state["selected_tool"] = "finish"
-        
+
     except Exception as e:
         print(f"   ⚠️ Error parsing router response: {e}")
         # Default fallback
         state["selected_tool"] = "tavily"
         state["search_queries"] = [state["query"]]
-    
+
     return state
 
 
@@ -514,13 +588,14 @@ def route_to_tool(state: AgentState) -> str:
 
 def should_continue_research(state: AgentState) -> str:
     """Decide whether to continue researching or write the report."""
-    if state["step_count"] >= 5:
+    max_iter = state.get("max_iterations", 5)
+    if state["step_count"] > max_iter:
         return "writer"
-    
+
     # Check if router signaled finish
     if state.get("selected_tool") == "finish":
         return "writer"
-    
+
     return "router"
 
 
@@ -572,18 +647,27 @@ def create_graph() -> StateGraph:
 # MAIN EXECUTION
 # ============================================================================
 
-def run_research_agent(query: str):
+def run_research_agent(query: str, forced_providers: List[str] = None, max_iterations: int = 5):
     """
     Run the multi-platform deep research agent.
-    
+
     Args:
         query: The research question or topic
+        forced_providers: List of providers to force (e.g., ["serper", "tavily"]).
+                         When set, bypasses the DeepSeek router and cycles through
+                         these providers round-robin.
+        max_iterations: Maximum number of research iterations (default: 5)
     """
     print("=" * 80)
     print("🚀 MULTI-PLATFORM DEEP RESEARCH AGENT")
     print("=" * 80)
-    print(f"\n📝 Query: {query}\n")
-    
+    print(f"\n📝 Query: {query}")
+    if forced_providers:
+        print(f"🔒 Forced Providers: {', '.join(p.upper() for p in forced_providers)}")
+    else:
+        print(f"🤖 Mode: Auto-routing (DeepSeek selects best provider)")
+    print(f"🔄 Max Iterations: {max_iterations}\n")
+
     # Initialize state
     initial_state = {
         "query": query,
@@ -591,36 +675,38 @@ def run_research_agent(query: str):
         "selected_tool": None,
         "search_queries": None,
         "step_count": 1,
-        "messages": [HumanMessage(content=query)]
+        "messages": [HumanMessage(content=query)],
+        "forced_providers": forced_providers,
+        "max_iterations": max_iterations,
     }
-    
+
     # Create and run the graph
     graph = create_graph()
-    
+
     try:
         print("\n" + "=" * 80)
         print("⚙️  STARTING RESEARCH WORKFLOW")
         print("=" * 80)
-        
+
         final_state = graph.invoke(initial_state)
-        
+
         print("\n" + "=" * 80)
         print("📊 FINAL REPORT")
         print("=" * 80 + "\n")
-        
+
         # Print final report
         final_message = final_state["messages"][-1]
         print(final_message.content)
-        
+
         # Save report to file
         save_report(query, final_message.content, final_state['research_context'])
-        
+
         print("\n" + "=" * 80)
         print("✅ RESEARCH COMPLETE")
         print("=" * 80)
         print(f"📈 Total research iterations: {final_state['step_count']}")
         print(f"📚 Total sources gathered: {len(final_state['research_context'])}")
-        
+
     except Exception as e:
         print(f"\n❌ Error during research: {e}")
         import traceback
@@ -628,22 +714,69 @@ def run_research_agent(query: str):
 
 
 if __name__ == "__main__":
-    # Example queries (uncomment to test):
-    
-    # Technical/Academic query (will use Exa)
-    # query = "GeoAI alanında son çıkan LoRA adaptör teknikleri üzerine makaleleri bul"
-    
-    # News/Finance query (will use Tavily)
-    # query = "Bugün Bitcoin neden düştü?"
-    
-    # Broad/Niche query (will use Serper)
-    # query = "Reddit'te en popüler yapay zeka projeleri neler?"
-    
-    # Get query from user input
-    import sys
-    if len(sys.argv) > 1:
-        query = " ".join(sys.argv[1:])
-    else:
-        query = input("🔍 Enter your research query: ")
-    
-    run_research_agent(query)
+    import argparse
+
+    VALID_PROVIDERS = ["exa", "tavily", "serper"]
+
+    parser = argparse.ArgumentParser(
+        description="Multi-Platform Deep Research Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Auto-mode (DeepSeek router picks best provider):
+  python main.py "quantum computing advances"
+
+  # Force specific providers (bypass router):
+  python main.py --providers serper,tavily "WorldView-3 satellite datasets"
+  python main.py -p serper "Reddit AI projects"
+  python main.py -p exa,serper,tavily "forest height estimation LiDAR"
+
+  # Control iterations:
+  python main.py --providers serper,tavily --iterations 8 "deep search query"
+
+Provider descriptions:
+  exa      Academic papers, technical docs, PDFs, whitepapers
+  tavily   Breaking news, market data, current events, advanced search
+  serper   Google web search, forums, Reddit, niche content
+        """
+    )
+
+    parser.add_argument(
+        "query",
+        nargs="*",
+        help="Research query (or use interactive mode if omitted)"
+    )
+
+    parser.add_argument(
+        "-p", "--providers",
+        type=str,
+        default=None,
+        help="Comma-separated list of search providers to force (e.g., serper,tavily,exa). "
+             "Bypasses the DeepSeek auto-router and cycles through providers round-robin."
+    )
+
+    parser.add_argument(
+        "-n", "--iterations",
+        type=int,
+        default=5,
+        help="Maximum research iterations (default: 5)"
+    )
+
+    args = parser.parse_args()
+
+    # Parse query
+    query = " ".join(args.query) if args.query else input("🔍 Enter your research query: ")
+
+    # Parse providers
+    forced_providers = None
+    if args.providers:
+        forced_providers = [p.strip().lower() for p in args.providers.split(",")]
+        invalid = [p for p in forced_providers if p not in VALID_PROVIDERS]
+        if invalid:
+            parser.error(f"Invalid provider(s): {', '.join(invalid)}. Valid: {', '.join(VALID_PROVIDERS)}")
+
+    run_research_agent(
+        query=query,
+        forced_providers=forced_providers,
+        max_iterations=args.iterations
+    )

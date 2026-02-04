@@ -47,11 +47,18 @@ async def handle_research(arguments: Any) -> list[TextContent | ImageContent | E
     """Handle research tool call."""
     query = arguments.get("query")
     max_iterations = arguments.get("max_iterations", 5)
-    
+    providers = arguments.get("providers")
+
     print(f"\n[MCP] Research: {query}")
-    
+    if providers:
+        print(f"[MCP] Forced providers: {providers}")
+
     try:
-        cmd = [sys.executable, "main.py", query]
+        cmd = [sys.executable, "main.py"]
+        if providers:
+            cmd.extend(["--providers", providers])
+        cmd.extend(["--iterations", str(max_iterations)])
+        cmd.append(query)
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -97,7 +104,7 @@ async def handle_list_reports(arguments: Any) -> list[TextContent | ImageContent
             text="No reports found. Run a research query first using the 'research' tool."
         )]
     
-    lines = [f"=Ú Saved Research Reports ({len(reports)} total)\n"]
+    lines = [f"=ï¿½ Saved Research Reports ({len(reports)} total)\n"]
     
     for i, filename in enumerate(reversed(reports[-limit:]), 1):
         filepath = REPORTS_DIR / filename
@@ -160,7 +167,7 @@ async def handle_get_report(arguments: Any) -> list[TextContent | ImageContent |
         
         return [TextContent(
             type="text",
-            text=f"=Ä Report: {filename}\n\n---\n{content}"
+            text=f"=ï¿½ Report: {filename}\n\n---\n{content}"
         )]
     except Exception as e:
         return [TextContent(
@@ -179,7 +186,7 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="research",
-            description="Run deep research on any topic using multi-platform agent (Exa, Tavily, Serper). Auto-detects language, selects best search engine, gathers 2000-3000+ sources, processes large contexts, and saves comprehensive academic report.",
+            description="Run deep research on any topic using multi-platform agent (Exa, Tavily, Serper). Auto-detects language, selects best search engine, gathers 2000-3000+ sources, processes large contexts, and saves comprehensive academic report. Use 'providers' to force specific search engines.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -189,10 +196,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "max_iterations": {
                         "type": "number",
-                        "description": "Maximum research iterations (default: 5, max: 5)",
+                        "description": "Maximum research iterations (default: 5)",
                         "default": 5,
                         "minimum": 1,
-                        "maximum": 5
+                        "maximum": 10
+                    },
+                    "providers": {
+                        "type": "string",
+                        "description": "Comma-separated list of search providers to force (bypasses auto-router). Options: exa, tavily, serper. Example: 'serper,tavily' will cycle through Serper and Tavily round-robin."
                     }
                 },
                 "required": ["query"]
@@ -252,7 +263,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
 async def main():
     """Start MCP server."""
     print("=" * 60, file=sys.stderr)
-    print("=€ DEEP SEARCH AGENT - MCP SERVER", file=sys.stderr)
+    print("=ï¿½ DEEP SEARCH AGENT - MCP SERVER", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     print("\nAvailable Tools:", file=sys.stderr)
     print("  1. research(query, max_iterations=5)", file=sys.stderr)
