@@ -33,10 +33,12 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 
 def get_report_files() -> List[str]:
-    """Get all saved report filenames."""
+    """Get all saved report filenames sorted by modification time (oldest first)."""
     if not REPORTS_DIR.exists():
         return []
-    return sorted([f.name for f in REPORTS_DIR.glob("*.md")])
+    files = list(REPORTS_DIR.glob("*.md"))
+    files.sort(key=lambda f: f.stat().st_mtime)
+    return [f.name for f in files]
 
 
 # ============================================================================
