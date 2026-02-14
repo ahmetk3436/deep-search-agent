@@ -3,11 +3,18 @@ Deep Search Agent - Remote MCP Server (SSE Transport)
 =====================================================
 HTTP-based MCP server for remote deployment on Coolify/Docker.
 Exposes research tools via Server-Sent Events protocol.
+
+Fixes (v1.1):
+- Result cache: skip re-research for recent identical queries (1h TTL)
+- Report cleanup: keep last 50 reports, auto-delete older ones
+- GLM-5 writer: upgraded from DeepSeek to GLM-5 (744B MoE)
+- Memory cleanup: research_context trimmed after each run
 """
 
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Any
 
@@ -33,6 +40,12 @@ BASE_DIR = Path(__file__).parent
 REPORTS_DIR = BASE_DIR / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
+MAX_REPORTS = 50  # Keep at most this many reports on disk
+CACHE_TTL = 3600  # 1 hour cache for identical queries
+
+# Simple in-memory cache: {query_key: (timestamp, report_filename)}
+_result_cache: dict[str, tuple[float, str]] = {}
+
 
 def get_report_files() -> List[str]:
     """Get all saved report filenames sorted by modification time (oldest first)."""
@@ -43,15 +56,57 @@ def get_report_files() -> List[str]:
     return [f.name for f in files]
 
 
+def cleanup_old_reports():
+    """Delete oldest reports if we exceed MAX_REPORTS."""
+    reports = get_report_files()
+    if len(reports) <= MAX_REPORTS:
+        return
+    to_delete = reports[: len(reports) - MAX_REPORTS]
+    for name in to_delete:
+        try:
+            (REPORTS_DIR / name).unlink()
+        except OSError:
+            pass
+
+
+def _cache_key(query: str, providers: str | None) -> str:
+    """Normalize query into a cache key."""
+    return f"{query.strip().lower()}|{providers or 'auto'}"
+
+
+def _check_cache(key: str) -> str | None:
+    """Return cached report filename if still valid, else None."""
+    if key not in _result_cache:
+        return None
+    ts, filename = _result_cache[key]
+    if time.time() - ts > CACHE_TTL:
+        del _result_cache[key]
+        return None
+    if not (REPORTS_DIR / filename).exists():
+        del _result_cache[key]
+        return None
+    return filename
+
+
 # ============================================================================
 # TOOL HANDLERS
 # ============================================================================
 
 async def handle_research(arguments: Any) -> list[TextContent]:
-    """Run deep research via async subprocess."""
+    """Run deep research via async subprocess with caching."""
     query = arguments.get("query")
     max_iterations = arguments.get("max_iterations", 5)
     providers = arguments.get("providers")
+
+    # Check cache first
+    key = _cache_key(query, providers)
+    cached = _check_cache(key)
+    if cached:
+        content = (REPORTS_DIR / cached).read_text(encoding="utf-8")
+        return [TextContent(
+            type="text",
+            text=f"# Research Complete (cached)\n\n**Query:** {query}\n**Report:** {cached}\n\n---\n\n{content}",
+        )]
 
     cmd = [sys.executable, str(BASE_DIR / "main.py")]
     if providers:
@@ -70,11 +125,16 @@ async def handle_research(arguments: Any) -> list[TextContent]:
             process.communicate(), timeout=600
         )
 
+        # Cleanup old reports after each run
+        cleanup_old_reports()
+
         reports = get_report_files()
         if reports:
             latest = reports[-1]
             filepath = REPORTS_DIR / latest
             content = filepath.read_text(encoding="utf-8")
+            # Cache the result
+            _result_cache[key] = (time.time(), latest)
             return [TextContent(
                 type="text",
                 text=f"# Research Complete\n\n**Query:** {query}\n**Report:** {latest}\n\n---\n\n{content}",
@@ -149,7 +209,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Run deep research on any topic using multi-provider search agent. "
                 "Uses DeepSeek-R1 for routing, Exa/Tavily/Serper for search, "
-                "and synthesizes a comprehensive academic report. "
+                "and GLM-5 (744B) for synthesis. Auto-caches results for 1 hour. "
                 "Supports auto-language detection and translation."
             ),
             inputSchema={
@@ -244,7 +304,10 @@ async def health(request):
     return JSONResponse({
         "status": "ok" if keys_configured else "degraded",
         "service": "deep-search-agent",
+        "version": "1.1.0",
+        "writer_model": os.getenv("WRITER_MODEL", "glm-5"),
         "reports_count": len(reports),
+        "cache_entries": len(_result_cache),
         "keys_configured": keys_configured,
     })
 
@@ -270,9 +333,13 @@ app = Starlette(
 # ============================================================================
 
 if __name__ == "__main__":
+    # Cleanup old reports on startup
+    cleanup_old_reports()
+
     port = int(os.getenv("PORT", 8080))
     host = os.getenv("HOST", "0.0.0.0")
-    print(f"Deep Search Agent MCP Server (SSE)")
+    print(f"Deep Search Agent MCP Server (SSE) v1.1.0")
+    print(f"Writer model: {os.getenv('WRITER_MODEL', 'glm-5')}")
     print(f"Listening on {host}:{port}")
     print(f"SSE endpoint: http://{host}:{port}/sse")
     print(f"Health check: http://{host}:{port}/health")

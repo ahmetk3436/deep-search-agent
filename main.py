@@ -56,13 +56,12 @@ deepseek_llm = ChatOpenAI(
     temperature=0.1
 )
 
-# Writer - Using DeepSeek for now (GLM-4.7 has credit issues)
-# Change back to GLM-4.7 when you have API credit
+# Writer - GLM-5 (upgraded from DeepSeek, 744B MoE with thinking)
 writer_llm = ChatOpenAI(
-    model="deepseek-chat",
-    base_url="https://api.deepseek.com",
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    temperature=0.7
+    model=os.getenv("WRITER_MODEL", "glm-5"),
+    base_url=os.getenv("WRITER_API_URL", "https://api.z.ai/api/paas/v4/chat/completions"),
+    api_key=os.getenv("ZHIPUAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY"),
+    temperature=float(os.getenv("WRITER_TEMPERATURE", "0.3")),
 )
 
 
@@ -522,11 +521,15 @@ def writer_node(state: AgentState) -> AgentState:
         )
     )
     
-    # Add final report to messages
-    state["messages"].append(AIMessage(content=response.content))
-    
+    # Add final report to messages (keep only the report, discard history)
+    state["messages"] = [HumanMessage(content=state["query"]), AIMessage(content=response.content)]
+
+    # Trim research_context to prevent memory bloat (keep last 20 entries)
+    if len(state["research_context"]) > 20:
+        state["research_context"] = state["research_context"][-20:]
+
     print(f"   → ✓ Report generated successfully!")
-    
+
     return state
 
 
